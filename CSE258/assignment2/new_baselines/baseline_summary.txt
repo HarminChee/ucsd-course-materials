@@ -1,0 +1,487 @@
+1. 数据与脚本总体结构
+
+数据来源与处理：
+
+原始数据：
+
+data_raw/f1_core/：Kaggle “Formula 1 World Championship (1950–2024)”
+
+核心文件：races.csv, results.csv, driver_standings.csv, drivers.csv, constructors.csv, circuits.csv 等。
+
+data_raw/f1_weather/：Kaggle “Formula 1 weather info (1950–2024)”
+
+核心文件：weather_features_v4.csv（包含 datetime, round, name, temperature, precipitation, windspeed, ...）。
+
+我们自建的预处理脚本：
+
+src/build_f1_datasets.py
+
+过滤年份：只保留 2000–2023 的近代 F1。
+
+基于 races + results + drivers + constructors + driver_standings 构造两个任务数据集：
+
+data_processed/task1_race_driver_podium.csv
+
+粒度：(raceId, driverId)
+
+标签：is_podium（是否进入领奖台）、finish_pos。
+
+特征：year, round, circuitId, grid, prerace_points, prerace_rank, prev1_finish, prev3_avg_finish, prev3_points, constructorId, ...
+
+data_processed/task2_driver_season_points_midround.csv
+
+粒度：(year, driverId)，每个车手一赛季一条。
+
+标签：final_points（赛季最终积分）。
+
+关键特征：mid_points（赛季中段积分，作为「中期战况」）、year, driverId。
+
+辅助映射（在多个脚本里复用）：
+
+(year, driverId) -> constructorId（该赛季“主车队”）：
+
+逻辑：在原始 results.csv 中统计车手在该年不同车队的出场次数，选择 race_count 最大的 constructorId 作为该赛季主车队。
+
+实现：build_driver_season_constructor_map(project_root)。
+
+raceId -> (temperature, precipitation, windspeed)：
+
+逻辑：races.csv 与 weather_features_v4.csv 按 (year, round, name) 联结。
+
+实现：load_race_weather_map(project_root)。
+
+(year, driverId) -> season-average weather：
+
+逻辑：对车手该赛季出战的所有 raceId，平均 temperature/precipitation/windspeed，得到 temp_avg, precip_avg, wind_avg（用于 Task2）。
+
+实现：build_driver_season_weather_numeric_map(project_root)。
+
+降水分桶（用于天气 baseline）：
+
+bucket_precip(x)：
+
+x <= 0 → "dry"
+
+0 < x < 1 → "light_rain"
+
+x >= 1 → "heavy_rain"
+
+NaN → "unknown"
+
+2. Task 1：分站领奖台预测（race-level podium prediction）
+
+目标：
+给定一场比赛前的信息（发车位、历史战绩、车队、天气等），对每个 (raceId, driverId) 预测该车手是否将登上领奖台（Top 3）。
+评价指标：
+
+Recall@3（podium hit rate）：每场比赛看预测 Top-3 中命中 true podium 的比例。
+
+Top-1 champion accuracy：每场比赛预测冠军是否正确。
+
+2.1 统计型 Baselines（无训练）
+
+脚本：src/task1_simple_baselines.py
+
+所有 baselines 都基于相同的数据划分：
+
+Train：2000–2014
+
+Val：2015–2018（目前 baseline 不用）
+
+Test：2019–2023（报告里所有数字都来自 Test）
+
+(1) Grid-only baseline
+
+思路：只看发车位置 grid，grid 越小分数越高。
+
+特征：grid_num = int(grid)，score = -grid_num。
+
+结果（Test）：
+
+Recall@3 = 0.5737
+
+Top-1 champion accuracy = 0.3365
+
+含义：仅靠发车位，已经可以抓住大约 57% 的领奖台车手，冠军预测命中率约 34%，是所有简单统计 baseline 里最强的一个。
+
+(2) Global podium rate baseline
+
+思路：用训练集中总体领奖台比例 p_global = P(podium) 作为所有车手的统一得分。
+
+结果：
+
+Global podium probability = 0.1382
+
+Recall@3 = 0.2372
+
+Top-1 accuracy = 0.2885
+
+含义：完全不区分车手/赛道，只用整体 podium 频率，作为“完全 naive baseline”。
+
+(3) Driver podium rate baseline
+
+思路：按车手统计 p(driver) = #podium / #races，测试时用该车手历史 podium 率作为得分；冷启动车手回退到 p_global。
+
+结果：
+
+有历史的车手数：93
+
+Recall@3 = 0.2660
+
+Top-1 accuracy = 0.0096
+
+含义：只看某个车手历史 podium 率，在 Recall@3 上比 global 稍好，但冠军预测几乎全错（Top-1 ≈ 1%）。
+
+(4) Driver–Circuit podium rate baseline（min_count=3）
+
+思路：统计 (driverId, circuitId) 组合的 podium 率：
+
+如果某组合出现次数 ≥ 3，则用 p(driver, circuit)；
+
+否则退回 p(driver)；若仍无历史，再退回 p_global。
+
+结果：
+
+(driver, circuit) 组合数：1752
+
+Recall@3 = 0.2692
+
+Top-1 accuracy = 0.0962
+
+含义：稍微利用「车手+赛道」偏好，有轻微提升，但总体仍明显弱于 grid-only。
+
+(5) Star-driver baseline（career podium counts）
+
+思路：按训练期累计 podium 次数对车手打分，并进行简单归一化。未上过领奖台的车手得 0。
+
+结果：
+
+podium>0 的 star drivers 数量：36
+
+Recall@3 = 0.2628
+
+Top-1 accuracy = 0.0000
+
+含义：相当于「永远押 Hamilton / Vettel / etc.」，在近年的 test 区间已经不 work 了。
+
+(6) Constructor podium rate baseline
+
+思路：按车队统计 p(constructor) = #podium / #races，每个 (race, driver) 使用对应车队 podium 率；冷启动车队退回 p_global。
+
+结果：
+
+车队数：30
+
+Recall@3 = 0.2019
+
+Top-1 accuracy = 0.0385
+
+含义：只用车队强弱来排序，效果明显弱于 grid-only 和 driver-level baselines。
+
+(7) Circuit-only podium rate baseline
+
+思路：按赛道统计 p(circuit) = #podium / #starts，不区分车手；冷启动赛道退回 p_global。
+
+结果：
+
+赛道数：28
+
+Recall@3 = 0.2372
+
+Top-1 accuracy = 0.2885
+
+含义：只看「赛道容易不容易出 podium」信息，效果接近 global baseline，说明赛道层面的整体 podium 率差异有限。
+
+(8) Era-aware driver podium baseline
+
+思路：
+
+定义规则时代：
+
+pre_hybrid：2000–2013
+
+v6_hybrid：2014–2021
+
+ground_effect：2022–
+
+统计 p(driver, era)，测试时优先使用 (driver, era)；退回 p(driver)；再退回 p_global。
+
+结果：
+
+(driver, era) 组合数：112
+
+Recall@3 = 0.3558
+
+Top-1 accuracy = 0.2885
+
+含义：加入简单的规则时代信息后，Recall@3 从 0.26–0.27 提升到 ~0.356，说明车手的 podium 能力在不同时代确实有明显差异（例如混动时代 vs 地面效应时代）。
+
+(9) Era × Driver × Weather podium baseline
+
+思路：
+
+在 (8) 的基础上加入天气分桶 weather_bucket = f(precipitation)：
+(driver, era, weather) → (driver, era) → driver → global。
+
+结果：
+
+(driver, era, weather) 组合数：276
+
+Recall@3 = 0.3558
+
+Top-1 accuracy = 0.2885
+
+含义：从 aggregate 指标来看，天气分桶（dry/light rain/heavy rain）在 test 区间内没有进一步提升整体 Recall@3，但提供了更细粒度的「条件频率 baseline」，方便后续做 case-study，比如比较「雨战王」之类的现象。
+
+2.2 Logistic Regression baseline（带天气特征的简单 ML 模型）
+
+脚本：src/train_task1_logreg_baseline.py
+
+特征设计：
+
+从 Task1 数据集和 races + weather 生成特征：
+
+起步位：grid_num
+
+赛季信息：year, round
+
+赛前状态：
+
+prerace_points（赛前累计积分）
+
+prerace_rank（赛前积分排名）
+
+prev1_finish（上场比赛完赛名次）
+
+prev3_avg_finish（近三场平均完赛名次）
+
+prev3_points（近三场累计积分）
+
+当站天气（从 weather_features_v4.csv 加入）：
+
+temperature
+
+precipitation
+
+windspeed
+
+预处理：
+
+用训练集的中位数填补缺失值；
+
+对所有特征做 StandardScaler 标准化；
+
+标签：is_podium ∈ {0,1}。
+
+模型结构：
+
+LogisticRegression(max_iter=200, class_weight="balanced", solver="lbfgs")
+
+训练集：2000–2014
+
+验证集：2015–2018（目前结果主要看 Test）
+
+测试集：2019–2023
+
+评估指标（Test）：
+
+全局二分类指标：
+
+ROC-AUC = 0.9235
+
+F1-score = 0.6374
+
+按比赛聚合：
+
+Recall@3 (podium hit rate) = 0.6506
+
+Top-1 champion accuracy = 0.5962
+
+对比结论：
+
+相比最强的纯统计 baseline（grid-only，Recall@3 ≈ 0.5737, Top-1 ≈ 0.3365），
+Logistic Regression:
+
+Recall@3 提升约 +0.08 绝对值；
+
+冠军命中率从约 33% 提升到约 60%。
+
+说明在 F1 分站预测中，即使只用线性模型，适度结合历史积分 + 短期 form + 天气特征，已经能明显超越任何单一规则或频率 baseline。
+
+3. Task 2：赛季最终积分预测（season-level final points prediction）
+
+目标：
+给定赛季中期积分与环境信息，预测车手赛季结束后的积分 final_points。
+评价指标：
+
+MAE, RMSE, R², Spearman 相关系数。
+
+所有结果基于：
+
+Train seasons：2000–2014 (N=340)
+
+Val seasons：2015–2018 (N=86)
+
+Test seasons：2019–2023 (N=103)
+
+3.1 统计型 Baselines（task2_simple_baselines.py）
+
+(1) Global mean baseline
+
+预测：对所有车手输出同一个 E[final_points]。
+
+结果：
+
+MAE = 88.6023
+
+RMSE = 134.4043
+
+R² = -0.2395（比简单常数回归还差）
+
+Spearman = nan（预测常数，相关系数无定义）
+
+(2) Driver historical mean baseline
+
+预测：E[final_points | driver]，即车手历史赛季积分均值；冷启动退回 global mean。
+
+结果：
+
+MAE = 86.9144
+
+RMSE = 123.7787
+
+R² = -0.0512
+
+Spearman = 0.1052
+
+含义：只看车手过去平均赛季表现，解释力仍然很弱。
+
+(3) mid_points baseline
+
+预测：final_points_pred = mid_points（直接用赛季中期积分作为最终积分）。
+
+结果：
+
+MAE = 55.2087
+
+RMSE = 84.0645
+
+R² = 0.5151
+
+Spearman = 0.9723
+
+含义：
+
+这是一个非常强的 baseline，说明车手赛季中期积分排序与赛季最终积分排序高度一致（相关系数 ~0.97）。
+
+但在绝对误差上仍然较大（MAE ~55 分）。
+
+(4) Era-aware driver mean baseline
+
+预测：E[final_points | driver, era(year)]，fallback 至 driver mean 和 global mean。
+
+结果：
+
+MAE = 80.4168
+
+RMSE = 117.6300
+
+R² = 0.0506
+
+Spearman = 0.2043
+
+含义：规则时代确实影响车手积分，但只靠历史平均值，效果仍远弱于 mid_points baseline。
+
+(5) Constructor mean baseline
+
+预测：E[final_points | constructorId]，基于 (year, driverId) -> constructorId 映射；冷启动退 global mean。
+
+结果：
+
+MAE = 62.2346
+
+RMSE = 93.8307
+
+R² = 0.3959
+
+Spearman = 0.8107
+
+含义：只用车队强弱，已经能解释不少方差，但仍弱于 mid_points baseline。
+
+(6) Constructor × Weather mean baseline
+
+思路：
+
+为每个 (year, driverId) 计算赛季平均降水 avg_precip，分桶为 season_weather_bucket ∈ {dry, light_rain, heavy_rain, unknown}。
+
+预测：E[final_points | constructorId, season_weather_bucket]；fallback 至 E[final_points | constructorId] 再 fallback 至 global mean。
+
+结果：
+
+MAE = 60.8582
+
+RMSE = 90.4637
+
+R² = 0.4385
+
+Spearman = 0.7637
+
+含义：相比纯 constructor baseline，在 MAE / RMSE / R² 上有外围提升（R²: 0.396 → 0.439），说明天气环境对不同车队的赛季表现有一定调制作用。但排名相关 Spearman 稍低于 constructor-only，也明显低于 mid_points baseline。
+
+3.2 Linear Regression baseline（mid_points + constructor + weather）
+
+脚本：src/train_task2_linear_baseline.py
+
+特征设计：
+
+核心特征：
+
+mid_points（赛季中期积分）
+
+year（捕捉时代趋势）
+
+赛季平均天气（对车手出战所有分站平均）：
+
+temp_avg
+
+precip_avg
+
+wind_avg
+
+constructorId（主车队，one-hot 编码）
+
+预处理：
+
+对数值特征 mid_points, year, temp_avg, precip_avg, wind_avg 用 train 的中位数填充缺失值；
+
+ColumnTransformer：
+
+数值：StandardScaler
+
+类别：OneHotEncoder(handle_unknown='ignore')
+
+模型：
+
+LinearRegression()（最基本的 OLS 回归）
+
+测试集结果：
+
+MAE = 19.1235
+
+RMSE = 24.4052
+
+R² = 0.9591
+
+Spearman = 0.9626
+
+对比结论：
+
+相比最强统计 baseline mid_points：
+
+MAE 从 ~55 降到 ~19，绝对误差减少约三分之二；
+
+R² 从约 0.51 提升到约 0.96（解释了接近全部方差）；
+
+Spearman 从 0.9723 降到 0.9626，略有下降——说明 mid_points 本身已经非常擅长保持排序，Linear Regression 在绝对值拟合上更好，但是对严格排名略有扰动。
+
+整体看，Linear Regression baseline 已经非常接近「上限表现」，后续如果你用更复杂的模型（RF/GBDT/NN）不一定能在 R² 上有巨大提升，更多是在 calibration / tail behavior 上做文章。

@@ -1,0 +1,16 @@
+Loading data and creating tokenizer ...
+Vocabulary size is 6694
+Decoder params: 985142
+Training decoder LM ...
+iter 100/500 loss 6.5773 train_ppl 756.14
+iter 200/500 loss 6.5596 train_ppl 666.42
+iter 300/500 loss 6.2057 train_ppl 484.21
+iter 400/500 loss 5.9446 train_ppl 344.94
+iter 500/500 loss 5.5007 train_ppl 249.87
+test_ppl_obama 638.83
+test_ppl_wbush 769.31
+test_ppl_hbush 706.93
+Input tensor shape: torch.Size([1, 32])
+Number of attention maps: 4
+Input tensor shape: torch.Size([1, 32])
+Number of attention maps: 4
